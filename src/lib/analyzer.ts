@@ -312,8 +312,9 @@ export function detectAppleBlocks(buf: Uint8Array): AppleBlock[] {
   return blocks;
 }
 
-function assignDuplicateGroups<T extends { offset: number; duplicateGroup?: string }>(
+function assignDuplicateGroups<T extends { duplicateGroup?: string }>(
   items: T[],
+  getOffset: (i: T) => number,
   keyFn: (i: T) => string | undefined,
   mirrorDistance = 0x80000,
 ): T[] {
@@ -326,11 +327,12 @@ function assignDuplicateGroups<T extends { offset: number; duplicateGroup?: stri
     byKey.set(k, arr);
   }
   for (const [k, arr] of byKey) {
-    arr.sort((a, b) => a.offset - b.offset);
+    arr.sort((a, b) => getOffset(a) - getOffset(b));
     if (arr.length < 2) continue;
     // If we have two similar copies far apart, tag them; otherwise still tag by key.
     const shouldMirrorTag =
-      arr.length >= 2 && Math.abs(arr[1].offset - arr[0].offset) >= mirrorDistance;
+      arr.length >= 2 &&
+      Math.abs(getOffset(arr[1]) - getOffset(arr[0])) >= mirrorDistance;
     for (const it of arr) {
       it.duplicateGroup = shouldMirrorTag ? k : k;
     }
@@ -344,6 +346,7 @@ export function detectMacintoshSpiBlocks(buf: Uint8Array): AppleBlock[] {
   );
   assignDuplicateGroups(
     blocks,
+    (b) => b.appleOffset,
     (b) => (b.modelCode?.value ? `macintosh_${b.modelCode.value}` : undefined),
   );
   return blocks;
@@ -371,7 +374,11 @@ export function detectCd3217FirmwareBlocks(buf: Uint8Array): Cd3217FirmwareBlock
       notes,
     });
   }
-  assignDuplicateGroups(blocks, (b) => (b.variant ? `cd3217_${b.variant}` : "cd3217"));
+  assignDuplicateGroups(
+    blocks,
+    (b) => b.offset,
+    (b) => (b.variant ? `cd3217_${b.variant}` : "cd3217"),
+  );
   blocks.sort((a, b) => a.offset - b.offset);
   return blocks;
 }
@@ -417,7 +424,7 @@ export function detectThunderboltRetimerBlocks(buf: Uint8Array): ThunderboltBloc
       merged.push(b);
     }
   }
-  assignDuplicateGroups(merged, (b) => `${b.blockType}`);
+  assignDuplicateGroups(merged, (b) => b.offset, (b) => `${b.blockType}`);
   return merged;
 }
 
