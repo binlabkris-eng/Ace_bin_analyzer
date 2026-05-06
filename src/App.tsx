@@ -8,7 +8,16 @@ import {
 } from "./lib/analyzer";
 import type { AppleBlock, CompareResult, FileAnalysis } from "./lib/types";
 
-type Tab = "Summary" | "Device Blocks" | "Manifest" | "Hex Preview" | "Compare" | "Export";
+type Tab =
+  | "Summary"
+  | "Apple Device Blocks"
+  | "MacBook SPI Blocks"
+  | "CD3217 Firmware"
+  | "Thunderbolt / Retimer"
+  | "Metadata / Manifest"
+  | "Hex Preview"
+  | "Compare"
+  | "Export";
 
 type LoadedFile = {
   id: string;
@@ -29,6 +38,10 @@ function fmtBytes(n: number): string {
 function badgeClass(t: string): string {
   if (t === "main_device_block") return "badge green";
   if (t === "secondary_subsystem_block") return "badge blue";
+  if (t === "macintosh_device_block") return "badge purple";
+  if (t === "cd3217_firmware_block") return "badge blue";
+  if (t === "thunderbolt_drom_block") return "badge purple";
+  if (t === "retimer_config_block") return "badge blue";
   if (t === "manifest_block") return "badge purple";
   return "badge gray";
 }
@@ -42,6 +55,12 @@ export default function App() {
   const [compareA, setCompareA] = useState<string | null>(null);
   const [compareB, setCompareB] = useState<string | null>(null);
   const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
+  const [showAllStrings, setShowAllStrings] = useState(false);
+  const [metadataCategory, setMetadataCategory] = useState<string>("All");
+  const [hexModalOffset, setHexModalOffset] = useState<number | null>(null);
+  const [hexStart, setHexStart] = useState<number>(0);
+  const [hexLen, setHexLen] = useState<number>(4096);
+  const [hexBytesPerLine, setHexBytesPerLine] = useState<number>(16);
 
   const selectedFile = useMemo(
     () => files.find((f) => f.id === selectedFileId) ?? null,
@@ -53,6 +72,20 @@ export default function App() {
     | { kind: "manifest"; offset: number }
     | null
   >(null);
+
+  function removeFile(id: string) {
+    setFiles((prev) => {
+      const next = prev.filter((f) => f.id !== id);
+      // adjust selected
+      if (selectedFileId === id) setSelectedFileId(next[0]?.id ?? null);
+      // adjust compare picks
+      if (compareA === id) setCompareA(null);
+      if (compareB === id) setCompareB(null);
+      // clear compare result if it referenced removed file
+      if (compareResult && (compareA === id || compareB === id)) setCompareResult(null);
+      return next;
+    });
+  }
 
   async function onUpload(inputFiles: FileList | null) {
     if (!inputFiles?.length) return;
@@ -143,22 +176,36 @@ export default function App() {
       a.buf,
       a.sha256,
       a.analysis.deviceBlocks,
+      a.analysis.fileStats,
+      a.analysis.firmwareBlocks,
       b.analysis.fileName,
       b.buf,
       b.sha256,
       b.analysis.deviceBlocks,
+      b.analysis.fileStats,
+      b.analysis.firmwareBlocks,
     );
     setCompareResult(res);
     setTab("Compare");
   }
 
   const hexPreview = useMemo(() => {
-    if (!selectedFile || !hexTarget) return "";
-    const base =
-      hexTarget.kind === "apple" ? hexTarget.appleOffset : hexTarget.offset;
-    const start = Math.max(0, base - 64);
+    if (!selectedFile) return "";
+    const start = Math.max(0, Math.min(selectedFile.buf.length, hexStart));
+    const len = Math.max(0, Math.min(selectedFile.buf.length - start, hexLen));
+    return hexdump(selectedFile.buf, start, len, hexBytesPerLine);
+  }, [selectedFile, hexStart, hexLen, hexBytesPerLine]);
+
+  const hexModalPreview = useMemo(() => {
+    if (!selectedFile || hexModalOffset === null) return "";
+    const start = Math.max(0, hexModalOffset - 64);
     return hexdump(selectedFile.buf, start, 256, 16);
-  }, [selectedFile, hexTarget]);
+  }, [selectedFile, hexModalOffset]);
+
+  async function copyHexModal() {
+    if (!hexModalPreview) return;
+    await navigator.clipboard.writeText(hexModalPreview);
+  }
 
   return (
     <div className="container">
@@ -171,7 +218,7 @@ export default function App() {
         </div>
         <div className="row">
           <button className="btn danger" onClick={clearAll} disabled={!files.length}>
-            Clear
+            Clear all
           </button>
         </div>
       </div>
@@ -207,7 +254,8 @@ export default function App() {
               Upload one or more Apple `.bin` dumps to start.
             </div>
           ) : (
-            <table className="table" style={{ marginTop: 8 }}>
+            <div style={{ marginTop: 8 }}>
+              <table className="table">
               <thead>
                 <tr>
                   <th>Pick</th>
@@ -236,7 +284,10 @@ export default function App() {
                             type="radio"
                             name="compareA"
                             checked={compareA === f.id}
-                            onChange={() => setCompareA(f.id)}
+                            onChange={() => {
+                              setCompareA(f.id);
+                              if (compareB === f.id) setCompareB(null);
+                            }}
                             title="Compare as A"
                           />
                           <label className="small">A</label>
@@ -244,10 +295,20 @@ export default function App() {
                             type="radio"
                             name="compareB"
                             checked={compareB === f.id}
-                            onChange={() => setCompareB(f.id)}
+                            onChange={() => {
+                              setCompareB(f.id);
+                              if (compareA === f.id) setCompareA(null);
+                            }}
                             title="Compare as B"
                           />
                           <label className="small">B</label>
+                          <button
+                            className="btn danger"
+                            onClick={() => removeFile(f.id)}
+                            title="Remove file from list"
+                          >
+                            Delete
+                          </button>
                         </div>
                       </td>
                       <td>
@@ -272,19 +333,37 @@ export default function App() {
                   );
                 })}
               </tbody>
-            </table>
+              </table>
+            </div>
           )}
 
           <div className="row" style={{ marginTop: 12 }}>
-            <button className="btn primary" onClick={runCompare} disabled={files.length < 2}>
+            <button
+              className="btn primary"
+              onClick={runCompare}
+              disabled={!compareA || !compareB || compareA === compareB}
+              title="Pick A and B first"
+            >
               Compare selected files
             </button>
           </div>
         </div>
 
-        <div className="panel">
+        <div className="panel panelRight">
           <div className="tabs">
-            {(["Summary", "Device Blocks", "Manifest", "Hex Preview", "Compare", "Export"] as Tab[]).map(
+            {(
+              [
+                "Summary",
+                "Apple Device Blocks",
+                "MacBook SPI Blocks",
+                "CD3217 Firmware",
+                "Thunderbolt / Retimer",
+                "Metadata / Manifest",
+                "Hex Preview",
+                "Compare",
+                "Export",
+              ] as Tab[]
+            ).map(
               (t) => (
                 <button
                   key={t}
@@ -303,7 +382,8 @@ export default function App() {
             </div>
           ) : tab === "Summary" ? (
             <div style={{ marginTop: 10 }}>
-              <table className="table">
+              <div className="tableWrap">
+                <table className="table tableWide">
                 <thead>
                   <tr>
                     <th>filename</th>
@@ -311,8 +391,14 @@ export default function App() {
                     <th>sha256</th>
                     <th>main device type</th>
                     <th>main model code</th>
+                    <th>family</th>
                     <th># Apple blocks</th>
+                    <th># CD3217 blocks</th>
+                    <th># Thunderbolt blocks</th>
                     <th># manifest markers</th>
+                    <th>FF%</th>
+                    <th>00%</th>
+                    <th>entropy</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -325,17 +411,31 @@ export default function App() {
                         <td className="mono">{selectedFile.analysis.sha256}</td>
                         <td>{main.type ?? "—"}</td>
                         <td className="mono">{main.model ?? "—"}</td>
+                        <td className="mono">{selectedFile.analysis.detectedFamily}</td>
                         <td className="mono">{selectedFile.analysis.deviceBlocks.length}</td>
+                        <td className="mono">{selectedFile.analysis.firmwareBlocks.length}</td>
+                        <td className="mono">{selectedFile.analysis.thunderboltBlocks.length}</td>
                         <td className="mono">{selectedFile.analysis.manifestMarkers.length}</td>
+                        <td className="mono">
+                          {selectedFile.analysis.fileStats.ffPercentage.toFixed(2)}
+                        </td>
+                        <td className="mono">
+                          {selectedFile.analysis.fileStats.zeroPercentage.toFixed(2)}
+                        </td>
+                        <td className="mono">
+                          {selectedFile.analysis.fileStats.entropy.toFixed(2)}
+                        </td>
                       </tr>
                     );
                   })()}
                 </tbody>
-              </table>
+                </table>
+              </div>
             </div>
-          ) : tab === "Device Blocks" ? (
+          ) : tab === "Apple Device Blocks" ? (
             <div style={{ marginTop: 10 }}>
-              <table className="table">
+              <div className="tableWrap">
+                <table className="table tableWide">
                 <thead>
                   <tr>
                     <th>block type</th>
@@ -348,7 +448,14 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {selectedFile.analysis.deviceBlocks.map((b, idx) => (
+                  {selectedFile.analysis.deviceBlocks
+                    .filter(
+                      (b) =>
+                        b.blockType === "main_device_block" ||
+                        b.blockType === "secondary_subsystem_block" ||
+                        b.blockType === "unknown_block",
+                    )
+                    .map((b, idx) => (
                     <tr key={`${b.appleOffset}-${idx}`}>
                       <td>
                         <span className={badgeClass(b.blockType)}>{b.blockType}</span>
@@ -378,65 +485,302 @@ export default function App() {
                     </tr>
                   ))}
                 </tbody>
-              </table>
+                </table>
+              </div>
               <div className="small" style={{ marginTop: 10 }}>
                 Detection is heuristic: it finds `Apple Inc.` then looks near it for `iPhone` / `iPad` / `ACE1P`,
                 plus a plausible model code (`DxxDEV` / `Jxxx`) and nearby manifest markers.
               </div>
             </div>
-          ) : tab === "Manifest" ? (
+          ) : tab === "MacBook SPI Blocks" ? (
             <div style={{ marginTop: 10 }}>
-              <table className="table">
+              <div className="tableWrap">
+                <table className="table tableWide">
                 <thead>
                   <tr>
+                    <th>block type</th>
+                    <th>Apple Inc. offset</th>
                     <th>marker</th>
-                    <th>offset</th>
-                    <th>notes</th>
+                    <th>type</th>
+                    <th>platform code</th>
+                    <th>confidence</th>
+                    <th>duplicate group</th>
                     <th>actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {selectedFile.analysis.manifestMarkers.map((m) => (
-                    <tr key={`${m.marker}-${m.offset}`}>
-                      <td className="mono">
-                        <span className="badge purple">{m.marker}</span>
-                      </td>
-                      <td className="mono">{m.offsetHex}</td>
-                      <td className="small">
-                        {m.marker === "IM4M" || m.marker === "BORD" || m.marker === "CHIP"
-                          ? "Strong proximity hint for Apple structure area."
-                          : "Manifest marker."}
-                      </td>
-                      <td>
-                        <button
-                          className="btn"
-                          onClick={() => {
-                            setHexTarget({ kind: "manifest", offset: m.offset });
-                            setTab("Hex Preview");
-                          }}
-                        >
-                          Hex
-                        </button>
-                      </td>
+                  {selectedFile.analysis.deviceBlocks
+                    .filter((b) => b.blockType === "macintosh_device_block")
+                    .map((b, idx) => (
+                      <tr key={`${b.appleOffset}-${idx}`}>
+                        <td>
+                          <span className={badgeClass(b.blockType)}>{b.blockType}</span>
+                        </td>
+                        <td className="mono">{b.appleOffsetHex}</td>
+                        <td className="mono">
+                          {b.marker ? `${b.marker.value} @ ${b.marker.offsetHex}` : "—"}
+                        </td>
+                        <td className="mono">
+                          {b.deviceType
+                            ? `${b.deviceType.value} @ ${b.deviceType.offsetHex}`
+                            : "—"}
+                        </td>
+                        <td className="mono">
+                          {b.modelCode
+                            ? `${b.modelCode.value} @ ${b.modelCode.offsetHex}`
+                            : "—"}
+                        </td>
+                        <td className="mono">{b.confidence.toFixed(2)}</td>
+                        <td className="mono">{b.duplicateGroup ?? "—"}</td>
+                        <td>
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              setHexTarget({ kind: "apple", appleOffset: b.appleOffset });
+                              setTab("Hex Preview");
+                            }}
+                          >
+                            Hex
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+                </table>
+              </div>
+              <div className="small" style={{ marginTop: 10 }}>
+                Macintosh SPI heuristic: `Apple Inc.` → `Macintosh` → platform code like `J314P01P`. Duplicates may
+                appear in mirrored regions of the dump.
+              </div>
+            </div>
+          ) : tab === "CD3217 Firmware" ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="tableWrap">
+                <table className="table tableWide">
+                <thead>
+                  <tr>
+                    <th>offset</th>
+                    <th>chip</th>
+                    <th>HW</th>
+                    <th>FW version</th>
+                    <th>variant</th>
+                    <th>duplicate group</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedFile.analysis.firmwareBlocks.map((b) => (
+                    <tr key={`${b.offset}-${b.variant ?? ""}`}>
+                      <td className="mono">{b.offsetHex}</td>
+                      <td className="mono">{b.chip}</td>
+                      <td className="mono">{b.hw ?? "—"}</td>
+                      <td className="mono">{b.fwVersion ?? "—"}</td>
+                      <td className="mono">{b.variant ?? "—"}</td>
+                      <td className="mono">{b.duplicateGroup ?? "—"}</td>
                     </tr>
                   ))}
                 </tbody>
-              </table>
+                </table>
+              </div>
+            </div>
+          ) : tab === "Thunderbolt / Retimer" ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="tableWrap">
+                <table className="table tableWide">
+                <thead>
+                  <tr>
+                    <th>block type</th>
+                    <th>offset</th>
+                    <th>markers</th>
+                    <th>duplicate group</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedFile.analysis.thunderboltBlocks.map((b) => (
+                    <tr key={`${b.blockType}-${b.offset}`}>
+                      <td>
+                        <span className={badgeClass(b.blockType)}>{b.blockType}</span>
+                      </td>
+                      <td className="mono">{b.offsetHex}</td>
+                      <td className="small mono">{b.markers.join(", ")}</td>
+                      <td className="mono">{b.duplicateGroup ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                </table>
+              </div>
+            </div>
+          ) : tab === "Metadata / Manifest" ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="small" style={{ marginBottom: 10 }}>
+                This view treats “manifest” broadly as metadata/config blocks (classic Apple markers, identity blocks,
+                CD3217/Thunderbolt/retimer sections, and ranked ASCII strings). Missing IM4M does not mean “no metadata”.
+              </div>
+              <div className="row" style={{ marginBottom: 10 }}>
+                <label className="small">Category</label>
+                <select
+                  className="btn"
+                  value={metadataCategory}
+                  onChange={(e) => setMetadataCategory(e.target.value)}
+                >
+                  <option>All</option>
+                  <option>Classic Apple Manifest</option>
+                  <option>Apple Identity</option>
+                  <option>MacBook SPI Metadata</option>
+                  <option>CD3217 Firmware Metadata</option>
+                  <option>Thunderbolt / DROM</option>
+                  <option>Retimer / Config</option>
+                  <option>Generic Strings</option>
+                </select>
+                <label className="small">
+                  <input
+                    type="checkbox"
+                    checked={showAllStrings}
+                    onChange={(e) => setShowAllStrings(e.target.checked)}
+                    style={{ marginRight: 8 }}
+                  />
+                  Show all extracted strings
+                </label>
+              </div>
+              <div className="tableWrap">
+                <table className="table tableWide">
+                <thead>
+                  <tr>
+                    <th>category</th>
+                    <th>subtype</th>
+                    <th>marker</th>
+                    <th>offset</th>
+                    <th>value</th>
+                    <th>confidence / score</th>
+                    <th>notes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(showAllStrings
+                    ? [
+                        ...selectedFile.analysis.metadataBlocks.filter(
+                          (m) => m.subtype !== "generic_ascii_string",
+                        ),
+                        ...selectedFile.analysis.genericStringsAll,
+                      ]
+                    : selectedFile.analysis.metadataBlocks
+                  )
+                    .filter((m) =>
+                      metadataCategory === "All" ? true : m.category === metadataCategory,
+                    )
+                    .map((m) => (
+                    <tr key={`${m.category}-${m.subtype}-${m.offset}-${m.primaryValue ?? ""}`}>
+                      <td className="small">{m.category}</td>
+                      <td className="small mono">{m.subtype}</td>
+                      <td className="mono">{m.markers[0] ?? "—"}</td>
+                      <td className="mono">
+                        <button
+                          className="btn"
+                          onClick={() => {
+                            setHexModalOffset(m.offset);
+                          }}
+                          title="Open hex snippet preview"
+                        >
+                          {m.offsetHex}
+                        </button>
+                      </td>
+                      <td className="small mono">{m.primaryValue ?? m.markers.join(" ")}</td>
+                      <td className="mono">
+                        {m.score <= 1 ? m.score.toFixed(2) : m.score.toFixed(0)}
+                      </td>
+                      <td className="small">{m.notes ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                </table>
+              </div>
             </div>
           ) : tab === "Hex Preview" ? (
             <div style={{ marginTop: 10 }}>
               <div className="row">
                 <div style={{ fontWeight: 700 }}>Hex preview</div>
                 <div className="small">
-                  {hexTarget
-                    ? `Centered near ${hexTarget.kind} @ ${toHexOffset(
-                        hexTarget.kind === "apple" ? hexTarget.appleOffset : hexTarget.offset,
-                      )}`
-                    : "Select a block/marker to preview."}
+                  {selectedFile ? `File: ${selectedFile.analysis.fileName}` : "Select a file to preview."}
                 </div>
               </div>
+              {selectedFile ? (
+                <div className="row" style={{ marginTop: 10, alignItems: "flex-end" }}>
+                  <div>
+                    <div className="small">Start offset (hex)</div>
+                    <input
+                      className="btn mono"
+                      value={toHexOffset(hexStart)}
+                      onChange={(e) => {
+                        const raw = e.target.value.trim().toLowerCase().replace(/^0x/, "");
+                        const n = Number.parseInt(raw || "0", 16);
+                        if (Number.isFinite(n)) setHexStart(Math.max(0, Math.min(n, selectedFile.buf.length)));
+                      }}
+                      style={{ width: 150 }}
+                    />
+                  </div>
+                  <div>
+                    <div className="small">Bytes to show</div>
+                    <input
+                      className="btn mono"
+                      value={hexLen}
+                      onChange={(e) => setHexLen(Math.max(0, Number(e.target.value) || 0))}
+                      style={{ width: 140 }}
+                    />
+                  </div>
+                  <div>
+                    <div className="small">Bytes/line</div>
+                    <input
+                      className="btn mono"
+                      value={hexBytesPerLine}
+                      onChange={(e) =>
+                        setHexBytesPerLine(Math.max(8, Math.min(32, Number(e.target.value) || 16)))
+                      }
+                      style={{ width: 120 }}
+                    />
+                  </div>
+                  <div className="row">
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        setHexStart(0);
+                        setHexLen(4096);
+                      }}
+                    >
+                      From start
+                    </button>
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        const base = hexTarget
+                          ? hexTarget.kind === "apple"
+                            ? hexTarget.appleOffset
+                            : hexTarget.offset
+                          : 0;
+                        setHexStart(Math.max(0, base - 64));
+                        setHexLen(512);
+                      }}
+                      disabled={!hexTarget}
+                      title="Use last selected block/marker as center"
+                    >
+                      Around hit
+                    </button>
+                    <button
+                      className="btn primary"
+                      onClick={() => {
+                        setHexStart(0);
+                        setHexLen(selectedFile.buf.length);
+                      }}
+                      title="May be heavy for large files"
+                    >
+                      Full file
+                    </button>
+                  </div>
+                  <div className="small mono" style={{ marginLeft: "auto" }}>
+                    size: {selectedFile.buf.length.toLocaleString()} bytes
+                  </div>
+                </div>
+              ) : null}
               <div className="codebox mono" style={{ marginTop: 10 }}>
-                {hexTarget ? hexPreview : "—"}
+                {selectedFile ? (hexPreview || "—") : "—"}
               </div>
             </div>
           ) : tab === "Compare" ? (
@@ -449,7 +793,8 @@ export default function App() {
                   <div className="panel" style={{ marginBottom: 10 }}>
                     {compareResult.summary}
                   </div>
-                  <table className="table">
+                  <div className="tableWrap">
+                    <table className="table tableWide">
                     <thead>
                       <tr>
                         <th>field</th>
@@ -490,6 +835,32 @@ export default function App() {
                         </td>
                       </tr>
                       <tr>
+                        <td>CD3217 variant</td>
+                        <td className="mono">{compareResult.cd3217VariantA ?? "—"}</td>
+                        <td className="mono">{compareResult.cd3217VariantB ?? "—"}</td>
+                        <td>
+                          {compareResult.cd3217VariantA && compareResult.cd3217VariantB
+                            ? compareResult.cd3217VariantA === compareResult.cd3217VariantB
+                              ? "match"
+                              : "different"
+                            : "unknown"}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td>FF% / 00% / entropy</td>
+                        <td className="mono">
+                          {compareResult.fileA.fileStats.ffPercentage.toFixed(2)} /{" "}
+                          {compareResult.fileA.fileStats.zeroPercentage.toFixed(2)} /{" "}
+                          {compareResult.fileA.fileStats.entropy.toFixed(2)}
+                        </td>
+                        <td className="mono">
+                          {compareResult.fileB.fileStats.ffPercentage.toFixed(2)} /{" "}
+                          {compareResult.fileB.fileStats.zeroPercentage.toFixed(2)} /{" "}
+                          {compareResult.fileB.fileStats.entropy.toFixed(2)}
+                        </td>
+                        <td className="mono">—</td>
+                      </tr>
+                      <tr>
                         <td>identical</td>
                         <td className="mono" colSpan={2}>
                           —
@@ -528,7 +899,8 @@ export default function App() {
                         </td>
                       </tr>
                     </tbody>
-                  </table>
+                    </table>
+                  </div>
                 </>
               )}
             </div>
@@ -549,6 +921,39 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {selectedFile && hexModalOffset !== null ? (
+        <div
+          className="modalBackdrop"
+          onClick={() => setHexModalOffset(null)}
+          role="presentation"
+        >
+          <div
+            className="modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="modalHeader">
+              <div>
+                <div style={{ fontWeight: 700 }}>Hex snippet</div>
+                <div className="small mono">
+                  {selectedFile.analysis.fileName} · offset {toHexOffset(hexModalOffset)}
+                </div>
+              </div>
+              <div className="row">
+                <button className="btn" onClick={copyHexModal}>
+                  Copy hexdump
+                </button>
+                <button className="btn danger" onClick={() => setHexModalOffset(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="codebox mono">{hexModalPreview || "—"}</div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
