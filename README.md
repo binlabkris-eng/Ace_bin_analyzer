@@ -1,4 +1,4 @@
-# Apple BIN Device Structure Analyzer (MVP)
+# Ice Rom BIN Structure Analyzer (MVP)
 
 ### Contributing BIN samples and pattern findings
 
