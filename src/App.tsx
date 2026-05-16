@@ -14,6 +14,7 @@ type Tab =
   | "MacBook SPI Blocks"
   | "CD3217 Firmware"
   | "Thunderbolt / Retimer"
+  | "ACE/ICE Commands"
   | "Metadata / Manifest"
   | "Hex Preview"
   | "Compare"
@@ -42,6 +43,9 @@ function badgeClass(t: string): string {
   if (t === "cd3217_firmware_block") return "badge blue";
   if (t === "thunderbolt_drom_block") return "badge purple";
   if (t === "retimer_config_block") return "badge blue";
+  if (t === "command_table_block") return "badge green";
+  if (t === "state_string_table_block") return "badge blue";
+  if (t.endsWith("_candidate")) return "badge purple";
   if (t === "manifest_block") return "badge purple";
   return "badge gray";
 }
@@ -184,6 +188,12 @@ export default function App() {
       b.analysis.deviceBlocks,
       b.analysis.fileStats,
       b.analysis.firmwareBlocks,
+      a.analysis.aceIceCommandTables,
+      b.analysis.aceIceCommandTables,
+      a.analysis.aceIceFirmwareMap,
+      b.analysis.aceIceFirmwareMap,
+      a.analysis.aceIceHandlerReferences,
+      b.analysis.aceIceHandlerReferences,
     );
     setCompareResult(res);
     setTab("Compare");
@@ -358,6 +368,7 @@ export default function App() {
                 "MacBook SPI Blocks",
                 "CD3217 Firmware",
                 "Thunderbolt / Retimer",
+                "ACE/ICE Commands",
                 "Metadata / Manifest",
                 "Hex Preview",
                 "Compare",
@@ -395,6 +406,8 @@ export default function App() {
                     <th># Apple blocks</th>
                     <th># CD3217 blocks</th>
                     <th># Thunderbolt blocks</th>
+                    <th># ACE/ICE tables</th>
+                    <th># ACE/ICE map blocks</th>
                     <th># manifest markers</th>
                     <th>FF%</th>
                     <th>00%</th>
@@ -415,6 +428,8 @@ export default function App() {
                         <td className="mono">{selectedFile.analysis.deviceBlocks.length}</td>
                         <td className="mono">{selectedFile.analysis.firmwareBlocks.length}</td>
                         <td className="mono">{selectedFile.analysis.thunderboltBlocks.length}</td>
+                        <td className="mono">{selectedFile.analysis.aceIceCommandTables.length}</td>
+                        <td className="mono">{selectedFile.analysis.aceIceFirmwareMap.length}</td>
                         <td className="mono">{selectedFile.analysis.manifestMarkers.length}</td>
                         <td className="mono">
                           {selectedFile.analysis.fileStats.ffPercentage.toFixed(2)}
@@ -609,6 +624,158 @@ export default function App() {
                 </table>
               </div>
             </div>
+          ) : tab === "ACE/ICE Commands" ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="small" style={{ marginBottom: 10 }}>
+                Detects grouped ACE/ICE command and state tags by pattern. The sample offsets are reference points only.
+              </div>
+              {selectedFile.analysis.aceIceConclusion ? (
+                <div className="panel" style={{ marginBottom: 10 }}>
+                  {selectedFile.analysis.aceIceConclusion}
+                </div>
+              ) : (
+                <div className="small" style={{ marginBottom: 10 }}>
+                  No ACE/ICE command table signature was detected in this dump.
+                </div>
+              )}
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>Command Table</div>
+              <div className="tableWrap">
+                <table className="table tableWide">
+                <thead>
+                  <tr>
+                    <th>tag</th>
+                    <th>offset</th>
+                    <th>likely meaning</th>
+                    <th>group</th>
+                    <th>confidence</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedFile.analysis.aceIceCommandTables
+                    .filter((b) => b.blockType === "command_table_block")
+                    .flatMap((b) => b.tags)
+                    .map((tag) => (
+                      <tr key={`cmd-${tag.groupId}-${tag.offset}-${tag.tag}`}>
+                        <td className="mono">
+                          {tag.isCommandPrefixDelimiter ? (
+                            <span className="badge purple">{tag.tag}</span>
+                          ) : (
+                            tag.tag
+                          )}
+                        </td>
+                        <td className="mono">{tag.offsetHex}</td>
+                        <td className="small">{tag.meaning}</td>
+                        <td className="mono">{tag.groupId}</td>
+                        <td className="mono">{tag.confidence.toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  {selectedFile.analysis.aceIceCommandTables.filter((b) => b.blockType === "command_table_block").length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="small">No command table block detected.</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+                </table>
+              </div>
+
+              <div style={{ fontWeight: 700, margin: "14px 0 6px" }}>State Table</div>
+              <div className="tableWrap">
+                <table className="table tableWide">
+                <thead>
+                  <tr>
+                    <th>tag</th>
+                    <th>offset</th>
+                    <th>likely meaning</th>
+                    <th>group</th>
+                    <th>confidence</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedFile.analysis.aceIceCommandTables
+                    .filter((b) => b.blockType === "state_string_table_block")
+                    .flatMap((b) => b.tags)
+                    .map((tag) => (
+                      <tr key={`state-${tag.groupId}-${tag.offset}-${tag.tag}`}>
+                        <td className="mono">{tag.tag}</td>
+                        <td className="mono">{tag.offsetHex}</td>
+                        <td className="small">{tag.meaning}</td>
+                        <td className="mono">{tag.groupId}</td>
+                        <td className="mono">{tag.confidence.toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  {selectedFile.analysis.aceIceCommandTables.filter((b) => b.blockType === "state_string_table_block").length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="small">No state string table block detected.</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+                </table>
+              </div>
+
+              <div style={{ fontWeight: 700, margin: "14px 0 6px" }}>Firmware Map</div>
+              <div className="tableWrap">
+                <table className="table tableWide">
+                <thead>
+                  <tr>
+                    <th>block type</th>
+                    <th>offset/range</th>
+                    <th>reason detected</th>
+                    <th>confidence</th>
+                    <th>notes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedFile.analysis.aceIceFirmwareMap.map((b, idx) => (
+                    <tr key={`${b.blockType}-${b.offsetHex ?? b.range}-${idx}`}>
+                      <td>
+                        <span className={badgeClass(b.blockType)}>{b.blockType}</span>
+                      </td>
+                      <td className="mono">{b.range ?? b.offsetHex ?? "—"}</td>
+                      <td className="small">{b.reason}</td>
+                      <td className="mono">{b.confidence.toFixed(2)}</td>
+                      <td className="small">{b.notes}</td>
+                    </tr>
+                  ))}
+                  {selectedFile.analysis.aceIceFirmwareMap.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="small">No ACE/ICE firmware map candidates detected.</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+                </table>
+              </div>
+
+              <div style={{ fontWeight: 700, margin: "14px 0 6px" }}>Handler References</div>
+              <div className="tableWrap">
+                <table className="table tableWide">
+                <thead>
+                  <tr>
+                    <th>command tag</th>
+                    <th>possible handler/function</th>
+                    <th>source</th>
+                    <th>confidence</th>
+                    <th>notes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedFile.analysis.aceIceHandlerReferences.map((r, idx) => (
+                    <tr key={`${r.commandTag ?? "unknown"}-${r.possibleHandlerFunction}-${idx}`}>
+                      <td className="mono">{r.commandTag ?? "—"}</td>
+                      <td className="mono">{r.possibleHandlerFunction}</td>
+                      <td className="small">{r.source}</td>
+                      <td className="mono">{r.confidence.toFixed(2)}</td>
+                      <td className="small">{r.notes}</td>
+                    </tr>
+                  ))}
+                  {selectedFile.analysis.aceIceHandlerReferences.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="small">No handler references detected.</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+                </table>
+              </div>
+            </div>
           ) : tab === "Metadata / Manifest" ? (
             <div style={{ marginTop: 10 }}>
               <div className="small" style={{ marginBottom: 10 }}>
@@ -627,6 +794,8 @@ export default function App() {
                   <option>Apple Identity</option>
                   <option>MacBook SPI Metadata</option>
                   <option>CD3217 Firmware Metadata</option>
+                  <option>ACE/ICE Commands</option>
+                  <option>ACE/ICE Firmware Map</option>
                   <option>Thunderbolt / DROM</option>
                   <option>Retimer / Config</option>
                   <option>Generic Strings</option>
@@ -845,6 +1014,63 @@ export default function App() {
                               : "different"
                             : "unknown"}
                         </td>
+                      </tr>
+                      <tr>
+                        <td>ACE/ICE tags</td>
+                        <td className="small mono">{compareResult.aceIceTagsA.join(", ") || "—"}</td>
+                        <td className="small mono">{compareResult.aceIceTagsB.join(", ") || "—"}</td>
+                        <td className="small">
+                          {compareResult.aceIceMissingFromA.length || compareResult.aceIceMissingFromB.length
+                            ? `missing from A: ${compareResult.aceIceMissingFromA.join(", ") || "none"}; missing from B: ${compareResult.aceIceMissingFromB.join(", ") || "none"}`
+                            : compareResult.aceIceTagsA.length
+                              ? "match"
+                              : "unknown"}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td>ACE/ICE command table offset</td>
+                        <td className="mono">{compareResult.aceIceCommandTableOffsetA ?? "—"}</td>
+                        <td className="mono">{compareResult.aceIceCommandTableOffsetB ?? "—"}</td>
+                        <td>
+                          {compareResult.aceIceCommandTableOffsetA && compareResult.aceIceCommandTableOffsetB
+                            ? compareResult.aceIceCommandTableOffsetA === compareResult.aceIceCommandTableOffsetB
+                              ? "match"
+                              : "different"
+                            : "unknown"}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td>ACE/ICE state table offset</td>
+                        <td className="mono">{compareResult.aceIceStateTableOffsetA ?? "—"}</td>
+                        <td className="mono">{compareResult.aceIceStateTableOffsetB ?? "—"}</td>
+                        <td>
+                          {compareResult.aceIceStateTableOffsetA && compareResult.aceIceStateTableOffsetB
+                            ? compareResult.aceIceStateTableOffsetA === compareResult.aceIceStateTableOffsetB
+                              ? "match"
+                              : "different"
+                            : "unknown"}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td>ACE/ICE availability differences</td>
+                        <td colSpan={2} className="small mono">
+                          {compareResult.aceIceCapabilityDiffs.join("\n") || "—"}
+                        </td>
+                        <td>{compareResult.aceIceCapabilityDiffs.length ? "different" : "—"}</td>
+                      </tr>
+                      <tr>
+                        <td>ACE/ICE firmware map differences</td>
+                        <td colSpan={2} className="small mono">
+                          {compareResult.aceIceFirmwareMapDiffs.slice(0, 8).join("\n") || "—"}
+                        </td>
+                        <td>{compareResult.aceIceFirmwareMapDiffs.length ? "different" : "—"}</td>
+                      </tr>
+                      <tr>
+                        <td>ACE/ICE handler reference differences</td>
+                        <td colSpan={2} className="small mono">
+                          {compareResult.aceIceHandlerDiffs.slice(0, 8).join("\n") || "—"}
+                        </td>
+                        <td>{compareResult.aceIceHandlerDiffs.length ? "different" : "—"}</td>
                       </tr>
                       <tr>
                         <td>FF% / 00% / entropy</td>

@@ -1,5 +1,9 @@
 import type {
   AppleBlock,
+  AceIceCommandTableBlock,
+  AceIceFirmwareMapBlock,
+  AceIceHandlerReference,
+  ArmThumbCodePattern,
   Cd3217FirmwareBlock,
   CompareResult,
   DetectedField,
@@ -428,6 +432,385 @@ export function detectThunderboltRetimerBlocks(buf: Uint8Array): ThunderboltBloc
   return merged;
 }
 
+export const ACE_ICE_COMMAND_TAGS: Record<string, string> = {
+  GSkX: "Get Status / eXchange",
+  DFUm: "DFU Mode / DFU Message",
+  DFUd: "DFU Download / DFU Data",
+  DRST: "Device Reset",
+  EUSB: "Enter USB Mode / Enable USB",
+  EURr: "USB Read / USB Request",
+  DPMc: "PD / Power Management Control",
+  VOUT: "Voltage Output / PD VOUT",
+  LDCM: "Load Command / Load Mode",
+  RDCI: "Read Command / Read Control",
+  "!CMD": "Command Prefix / Delimiter",
+  CFUp: "CFU Prepare / Check Function",
+  APP: "Application Mode",
+  UFPf: "UFP Function / USB-C Upstream Facing Port",
+  DFUf: "DFU Function / DFU Finish",
+};
+
+const ACE_ICE_STATE_TAGS = new Set(["CFUp", "APP", "VOUT", "UFPf", "DFUf"]);
+const ACE_ICE_COMMAND_CAPABILITY_TAGS = ["DFUm", "DFUd", "EUSB", "EURr", "DPMc", "VOUT"];
+
+function readU16Le(buf: Uint8Array, offset: number): number {
+  if (offset + 1 >= buf.length) return 0;
+  return buf[offset] | (buf[offset + 1] << 8);
+}
+
+function readU32Le(buf: Uint8Array, offset: number): number {
+  if (offset + 3 >= buf.length) return 0;
+  return (
+    buf[offset] |
+    (buf[offset + 1] << 8) |
+    (buf[offset + 2] << 16) |
+    (buf[offset + 3] << 24)
+  ) >>> 0;
+}
+
+function alignDown(n: number, alignment: number): number {
+  return Math.max(0, n - (n % alignment));
+}
+
+function rangeHex(start: number, end: number): string {
+  return `${toHexOffset(start)}-${toHexOffset(end)}`;
+}
+
+function nonBlankDensity(buf: Uint8Array, start: number, end: number): number {
+  const s = Math.max(0, start);
+  const e = Math.min(buf.length, end);
+  if (e <= s) return 0;
+  let nonBlank = 0;
+  for (let i = s; i < e; i++) {
+    if (buf[i] !== 0x00 && buf[i] !== 0xff) nonBlank++;
+  }
+  return nonBlank / (e - s);
+}
+
+function isThumbLikeInstruction(v: number): boolean {
+  return (
+    (v & 0xff00) === 0xb500 || // push
+    (v & 0xff00) === 0xbd00 || // pop
+    (v & 0xf800) === 0xe000 || // unconditional branch
+    (v & 0xf000) === 0xd000 || // conditional branch / svc class
+    (v & 0xf800) === 0x2000 || // movs immediate
+    (v & 0xf800) === 0x2800 || // cmp immediate
+    (v & 0xf800) === 0x4800 || // ldr literal
+    (v & 0xf000) === 0x6000 || // str/ldr register/immediate family
+    (v & 0xff00) === 0x4600 || // mov high register
+    (v & 0xff80) === 0x4700 // bx/blx
+  );
+}
+
+function thumbDensity(buf: Uint8Array, start: number, end: number): number {
+  let total = 0;
+  let hits = 0;
+  for (let i = Math.max(0, start); i + 1 < Math.min(buf.length, end); i += 2) {
+    total++;
+    if (isThumbLikeInstruction(readU16Le(buf, i))) hits++;
+  }
+  return total ? hits / total : 0;
+}
+
+function findAsciiMovPatterns(buf: Uint8Array, start: number, end: number): string[] {
+  const chars = new Set<string>();
+  for (let i = Math.max(0, start); i + 1 < Math.min(buf.length, end); i += 2) {
+    const v = readU16Le(buf, i);
+    if ((v & 0xf800) !== 0x2000) continue;
+    const imm = v & 0xff;
+    if (imm === 0x31 || imm === 0x4d || imm === 0x4b || imm === 0x4f) {
+      chars.add(String.fromCharCode(imm));
+    }
+  }
+  return [...chars].sort();
+}
+
+function findLittleEndianReferences(buf: Uint8Array, target: number, limit = 20): number[] {
+  const refs: number[] = [];
+  for (let i = 0; i + 3 < buf.length; i++) {
+    if (readU32Le(buf, i) === target) {
+      refs.push(i);
+      if (refs.length >= limit) break;
+    }
+  }
+  return refs;
+}
+
+export function detectAceIceCommandTables(buf: Uint8Array): AceIceCommandTableBlock[] {
+  const hits: { tag: string; offset: number }[] = [];
+  for (const tag of Object.keys(ACE_ICE_COMMAND_TAGS)) {
+    for (const offset of findAsciiOccurrences(buf, tag)) {
+      hits.push({ tag, offset });
+    }
+  }
+  hits.sort((a, b) => a.offset - b.offset || a.tag.localeCompare(b.tag));
+
+  const groups: { id: string; hits: { tag: string; offset: number }[] }[] = [];
+  for (const hit of hits) {
+    const last = groups[groups.length - 1];
+    if (last && hit.offset - last.hits[last.hits.length - 1].offset <= 0x100) {
+      last.hits.push(hit);
+    } else {
+      groups.push({ id: `aceice_group_${groups.length + 1}`, hits: [hit] });
+    }
+  }
+
+  const blocks: AceIceCommandTableBlock[] = [];
+  for (const group of groups) {
+    const uniqueTags = new Set(group.hits.map((h) => h.tag));
+    const stateCount = [...uniqueTags].filter((tag) => ACE_ICE_STATE_TAGS.has(tag)).length;
+    const hasStateSignature =
+      stateCount >= 3 &&
+      (uniqueTags.has("CFUp") || uniqueTags.has("APP")) &&
+      (uniqueTags.has("UFPf") || uniqueTags.has("DFUf") || uniqueTags.has("VOUT"));
+    const hasCommandSignature = uniqueTags.size >= 5;
+    if (!hasCommandSignature && !hasStateSignature) continue;
+
+    const startOffset = Math.min(...group.hits.map((h) => h.offset));
+    const endOffset = Math.max(...group.hits.map((h) => h.offset + h.tag.length));
+    const span = Math.max(1, endOffset - startOffset);
+    const blockType: AceIceCommandTableBlock["blockType"] =
+      hasStateSignature && (!hasCommandSignature || stateCount >= uniqueTags.size - 1)
+        ? "state_string_table_block"
+        : "command_table_block";
+    const confidence = clamp01(
+      0.45 +
+        Math.min(0.35, uniqueTags.size * 0.045) +
+        (span <= 0x100 ? 0.1 : 0) +
+        (uniqueTags.has("!CMD") ? 0.08 : 0) +
+        (hasStateSignature ? 0.07 : 0),
+    );
+
+    blocks.push({
+      blockType,
+      startOffset,
+      startOffsetHex: toHexOffset(startOffset),
+      endOffset,
+      endOffsetHex: toHexOffset(endOffset),
+      tags: group.hits.map((h) => ({
+        tag: h.tag,
+        offset: h.offset,
+        offsetHex: toHexOffset(h.offset),
+        asciiValue: h.tag,
+        meaning: ACE_ICE_COMMAND_TAGS[h.tag],
+        groupId: group.id,
+        confidence,
+        isCommandPrefixDelimiter: h.tag === "!CMD" || undefined,
+      })),
+      confidence,
+      notes: [
+        `${uniqueTags.size} known ACE/ICE tag(s) found within ${toHexOffset(span)}.`,
+        blockType === "state_string_table_block"
+          ? "State-oriented tag signature detected."
+          : "Command-oriented tag signature detected.",
+      ],
+    });
+  }
+
+  return blocks.sort((a, b) => a.startOffset - b.startOffset);
+}
+
+export function detectArmThumbCodePatterns(buf: Uint8Array): ArmThumbCodePattern[] {
+  const regions: ArmThumbCodePattern[] = [];
+  const window = 0x100;
+  const step = 0x80;
+
+  for (let start = 0; start < buf.length; start += step) {
+    const end = Math.min(buf.length, start + window);
+    const density = thumbDensity(buf, start, end);
+    const blank = nonBlankDensity(buf, start, end);
+    if (density < 0.28 || blank < 0.15) continue;
+
+    const movChars = findAsciiMovPatterns(buf, start, end);
+    const branchBonus = (() => {
+      let branches = 0;
+      for (let i = start; i + 1 < end; i += 2) {
+        const v = readU16Le(buf, i);
+        if ((v & 0xf800) === 0xe000 || (v & 0xf000) === 0xd000) branches++;
+      }
+      return branches;
+    })();
+    const blockType: ArmThumbCodePattern["blockType"] =
+      movChars.length >= 2 || branchBonus >= 6
+        ? "handler_function_candidate"
+        : "arm_thumb_code_region";
+    const confidence = clamp01(0.35 + density * 0.85 + Math.min(0.12, movChars.length * 0.03));
+    const last = regions[regions.length - 1];
+    if (last && start - last.endOffset <= step && last.blockType === blockType) {
+      last.endOffset = end;
+      last.endOffsetHex = toHexOffset(end);
+      last.confidence = Math.max(last.confidence, confidence);
+      continue;
+    }
+    regions.push({
+      blockType,
+      startOffset: start,
+      startOffsetHex: toHexOffset(start),
+      endOffset: end,
+      endOffsetHex: toHexOffset(end),
+      confidence,
+      reason: `Thumb-like density ${(density * 100).toFixed(1)}%`,
+      notes: movChars.length
+        ? [`Loads ASCII-like immediates: ${movChars.join(", ")}`]
+        : ["Common Thumb instruction patterns detected."],
+    });
+  }
+
+  return regions.sort((a, b) => b.confidence - a.confidence || a.startOffset - b.startOffset).slice(0, 40);
+}
+
+export function detectAceIceHandlerReferences(
+  buf: Uint8Array,
+  commandTables = detectAceIceCommandTables(buf),
+  thumbPatterns = detectArmThumbCodePatterns(buf),
+): AceIceHandlerReference[] {
+  const refs: AceIceHandlerReference[] = [];
+  const tableRefs = new Map<number, AceIceCommandTableBlock>();
+  for (const table of commandTables) {
+    for (const ref of findLittleEndianReferences(buf, table.startOffset, 12)) {
+      tableRefs.set(ref, table);
+    }
+  }
+
+  for (const [refOffset, table] of tableRefs) {
+    const nearbyCode = thumbPatterns.find(
+      (r) => Math.abs(r.startOffset - refOffset) <= 0x400 || (refOffset >= r.startOffset && refOffset <= r.endOffset),
+    );
+    refs.push({
+      commandTag: table.tags[0]?.tag,
+      possibleHandlerFunction: nearbyCode
+        ? rangeHex(nearbyCode.startOffset, nearbyCode.endOffset)
+        : toHexOffset(refOffset),
+      source: `table reference @ ${toHexOffset(refOffset)}`,
+      confidence: nearbyCode ? 0.72 : 0.55,
+      notes: `${table.blockType} start offset is referenced in little-endian form.`,
+    });
+  }
+
+  for (const table of commandTables.filter((t) => t.blockType === "command_table_block")) {
+    for (const tag of table.tags) {
+      const nearest = thumbPatterns
+        .filter((r) => r.blockType !== "arm_thumb_code_region")
+        .sort((a, b) => Math.abs(a.startOffset - tag.offset) - Math.abs(b.startOffset - tag.offset))[0];
+      if (!nearest) continue;
+      refs.push({
+        commandTag: tag.tag,
+        possibleHandlerFunction: rangeHex(nearest.startOffset, nearest.endOffset),
+        source: "nearby Thumb handler heuristic",
+        confidence: Math.max(0.45, nearest.confidence - 0.15),
+        notes: `${tag.tag} appears in a command table; nearest Thumb-like handler candidate is reported.`,
+      });
+    }
+  }
+
+  return refs
+    .sort((a, b) => b.confidence - a.confidence || a.possibleHandlerFunction.localeCompare(b.possibleHandlerFunction))
+    .slice(0, 50);
+}
+
+function pointerCandidateCount(buf: Uint8Array, start: number, end: number): number {
+  let count = 0;
+  for (let i = Math.max(0, start); i + 3 < Math.min(buf.length, end); i += 4) {
+    const v = readU32Le(buf, i);
+    if ((v > 0 && v < buf.length) || (v >= 0x20000000 && v <= 0x200fffff) || (v >= 0x40000000 && v <= 0x400fffff)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+export function detectAceIceFirmwareMap(buf: Uint8Array): AceIceFirmwareMapBlock[] {
+  const commandTables = detectAceIceCommandTables(buf);
+  if (!commandTables.length) return [];
+  const thumbPatterns = detectArmThumbCodePatterns(buf);
+  const blocks: AceIceFirmwareMapBlock[] = [];
+
+  for (let start = 0; start < Math.min(buf.length, 0x20000); start += 0x40) {
+    const end = Math.min(buf.length, start + 0x100);
+    const nonBlank = nonBlankDensity(buf, start, end);
+    const pointers = pointerCandidateCount(buf, start, end);
+    const code = thumbDensity(buf, start, end);
+    if (nonBlank >= 0.2 && pointers >= 2 && code >= 0.18) {
+      blocks.push({
+        blockType: "boot_header_candidate",
+        offset: start,
+        offsetHex: toHexOffset(start),
+        reason: "Low firmware region has non-blank data, pointer-like values, and nearby Thumb-like code.",
+        confidence: clamp01(0.45 + pointers * 0.03 + code),
+        notes: "Pattern-based boot/header candidate; sample offsets are not treated as universal.",
+      });
+      break;
+    }
+  }
+
+  const codeRegions = [...thumbPatterns].sort((a, b) => a.startOffset - b.startOffset);
+  const main = codeRegions[0];
+  if (main) {
+    blocks.push({
+      blockType: "main_firmware_candidate",
+      range: rangeHex(main.startOffset, main.endOffset),
+      reason: main.reason,
+      confidence: clamp01(main.confidence),
+      notes: "First substantial Thumb-like region.",
+    });
+  }
+  const secondary = codeRegions.find((r) => main && r.startOffset - main.endOffset > 0x1000);
+  if (secondary) {
+    blocks.push({
+      blockType: "secondary_firmware_candidate",
+      range: rangeHex(secondary.startOffset, secondary.endOffset),
+      reason: secondary.reason,
+      confidence: clamp01(secondary.confidence - 0.08),
+      notes: "Additional distinct Thumb-like region, possibly secondary firmware.",
+    });
+  }
+
+  for (const table of commandTables) {
+    const start = alignDown(Math.max(0, table.startOffset - 0x20), 0x10);
+    const end = Math.min(buf.length, table.endOffset + 0x80);
+    blocks.push({
+      blockType: "config_block_candidate",
+      offset: start,
+      offsetHex: toHexOffset(start),
+      range: rangeHex(start, end),
+      reason: `${table.blockType} with ACE/ICE command/state tags is embedded in this local structure.`,
+      confidence: clamp01(table.confidence - 0.05),
+      notes: "Located near grouped command/state tags and small structured values.",
+    });
+  }
+
+  const seenRuntime = new Set<number>();
+  const seenPeripheral = new Set<number>();
+  for (let i = 0; i + 3 < buf.length; i += 4) {
+    const v = readU32Le(buf, i);
+    if (v >= 0x20040000 && v <= 0x2004ffff && !seenRuntime.has(v)) {
+      seenRuntime.add(v);
+      blocks.push({
+        blockType: "runtime_config_reference",
+        offset: i,
+        offsetHex: toHexOffset(i),
+        reason: `Pointer-like runtime/RAM config value ${toHexOffset(v)} found.`,
+        confidence: 0.62,
+        notes: "RAM-mapped config reference candidate, not a file offset.",
+      });
+    }
+    if (v >= 0x40060000 && v <= 0x4006ffff && !seenPeripheral.has(v)) {
+      seenPeripheral.add(v);
+      blocks.push({
+        blockType: "peripheral_register_reference",
+        offset: i,
+        offsetHex: toHexOffset(i),
+        reason: `Peripheral/register-like value ${toHexOffset(v)} found.`,
+        confidence: v === 0x40060400 ? 0.72 : 0.58,
+        notes: "Peripheral/register reference candidate, not a file offset.",
+      });
+    }
+    if (seenRuntime.size + seenPeripheral.size >= 12) break;
+  }
+
+  return blocks.sort((a, b) => (a.offset ?? 0) - (b.offset ?? 0) || b.confidence - a.confidence);
+}
+
 function clamp01(x: number): number {
   return Math.min(1, Math.max(0, x));
 }
@@ -573,7 +956,39 @@ export function detectMetadataBlocks(buf: Uint8Array): {
     });
   }
 
-  // 5) Generic ASCII metadata (top only by default)
+  // 5) ACE/ICE command tables and firmware-map metadata
+  const aceTables = detectAceIceCommandTables(buf);
+  for (const t of aceTables) {
+    addMetadata(out, {
+      category: "ACE/ICE Commands",
+      subtype:
+        t.blockType === "state_string_table_block"
+          ? "ace_ice_state_table_metadata"
+          : "ace_ice_command_table_metadata",
+      offset: t.startOffset,
+      offsetHex: t.startOffsetHex,
+      markers: t.tags.map((tag) => tag.tag),
+      primaryValue: t.blockType,
+      score: t.confidence,
+      notes: t.notes.join(" "),
+    });
+  }
+
+  const aceMap = detectAceIceFirmwareMap(buf);
+  for (const m of aceMap) {
+    addMetadata(out, {
+      category: "ACE/ICE Firmware Map",
+      subtype: "ace_ice_firmware_map_metadata",
+      offset: m.offset ?? 0,
+      offsetHex: m.offsetHex ?? "0x00000000",
+      markers: [m.blockType],
+      primaryValue: m.range ?? m.offsetHex ?? m.blockType,
+      score: m.confidence,
+      notes: `${m.reason} ${m.notes}`,
+    });
+  }
+
+  // 6) Generic ASCII metadata (top only by default)
   const generic = detectGenericAsciiMetadata(buf);
   out.push(...generic.top);
 
@@ -586,6 +1001,7 @@ function buildSmartMetadataNotes(params: {
   hasIdentity: boolean;
   hasMac: boolean;
   hasCd: boolean;
+  hasAceIce: boolean;
   hasTbOrRetimer: boolean;
 }): string[] {
   const notes: string[] = [];
@@ -609,6 +1025,11 @@ function buildSmartMetadataNotes(params: {
   if (params.hasTbOrRetimer) {
     notes.push(
       "Thunderbolt/DROM/retimer dumps may not include classic Apple firmware manifests but still contain structured configuration metadata.",
+    );
+  }
+  if (params.hasAceIce) {
+    notes.push(
+      "ACE/ICE command/state metadata detected from grouped short ASCII tags; table offsets are pattern-derived, not fixed.",
     );
   }
   return notes;
@@ -657,11 +1078,26 @@ export async function analyzeFile(file: File): Promise<FileAnalysis> {
   const deviceBlocks = detectAppleBlocks(u8);
   const firmwareBlocks = detectCd3217FirmwareBlocks(u8);
   const thunderboltBlocks = detectThunderboltRetimerBlocks(u8);
+  const aceIceCommandTables = detectAceIceCommandTables(u8);
+  const armThumbCodePatterns = detectArmThumbCodePatterns(u8);
+  const aceIceFirmwareMap = detectAceIceFirmwareMap(u8);
+  const aceIceHandlerReferences = detectAceIceHandlerReferences(
+    u8,
+    aceIceCommandTables,
+    armThumbCodePatterns,
+  );
+  const aceIceConclusion = buildAceIceConclusion({
+    commandTables: aceIceCommandTables,
+    firmwareMap: aceIceFirmwareMap,
+    handlerRefs: aceIceHandlerReferences,
+    thumbPatterns: armThumbCodePatterns,
+  });
   const meta = detectMetadataBlocks(u8);
 
   const hasMac = deviceBlocks.some((b) => b.blockType === "macintosh_device_block");
   const hasCd = firmwareBlocks.length > 0;
   const hasTb = thunderboltBlocks.length > 0;
+  const hasAceIce = aceIceCommandTables.length > 0 || aceIceFirmwareMap.length > 0;
   const hasClassic = manifestMarkers.length > 0;
   const hasIdentity = deviceBlocks.some(
     (b) =>
@@ -669,13 +1105,15 @@ export async function analyzeFile(file: File): Promise<FileAnalysis> {
       b.blockType === "secondary_subsystem_block" ||
       b.blockType === "macintosh_device_block",
   );
-  const detectedFamily: FileAnalysis["detectedFamily"] = hasMac || hasCd
-    ? "macbook_spi_cd3217"
-    : hasTb
-      ? "thunderbolt_retimer"
-      : deviceBlocks.some((b) => b.blockType === "main_device_block" || b.blockType === "secondary_subsystem_block")
-        ? "iphone_ipad_firmware_config"
-        : "unknown";
+  const detectedFamily: FileAnalysis["detectedFamily"] = hasAceIce
+    ? "ace_ice_firmware"
+    : hasMac || hasCd
+      ? "macbook_spi_cd3217"
+      : hasTb
+        ? "thunderbolt_retimer"
+        : deviceBlocks.some((b) => b.blockType === "main_device_block" || b.blockType === "secondary_subsystem_block")
+          ? "iphone_ipad_firmware_config"
+          : "unknown";
 
   return {
     fileName: file.name,
@@ -686,6 +1124,11 @@ export async function analyzeFile(file: File): Promise<FileAnalysis> {
     deviceBlocks,
     firmwareBlocks,
     thunderboltBlocks,
+    aceIceCommandTables,
+    aceIceFirmwareMap,
+    aceIceHandlerReferences,
+    aceIceConclusion,
+    armThumbCodePatterns,
     manifestMarkers,
     metadataBlocks: meta.metadataBlocks,
     genericStringsAll: meta.genericStringsAll,
@@ -696,6 +1139,7 @@ export async function analyzeFile(file: File): Promise<FileAnalysis> {
         hasIdentity,
         hasMac,
         hasCd,
+        hasAceIce,
         hasTbOrRetimer: hasTb,
       }),
     ],
@@ -707,6 +1151,84 @@ function mainModel(blocks: AppleBlock[]): string | undefined {
     .filter((b) => b.blockType === "main_device_block" && b.modelCode?.value)
     .sort((a, b) => b.confidence - a.confidence);
   return mains[0]?.modelCode?.value;
+}
+
+function aceIceTagSet(tables: AceIceCommandTableBlock[]): string[] {
+  return [...new Set(tables.flatMap((t) => t.tags.map((tag) => tag.tag)))].sort();
+}
+
+function arrayDiff(a: string[], b: string[]): string[] {
+  const bSet = new Set(b);
+  return a.filter((x) => !bSet.has(x)).sort();
+}
+
+function firstAceIceOffset(
+  tables: AceIceCommandTableBlock[],
+  blockType: AceIceCommandTableBlock["blockType"],
+): `0x${string}` | undefined {
+  return tables.find((t) => t.blockType === blockType)?.startOffsetHex;
+}
+
+function aceIceMapSignature(blocks: AceIceFirmwareMapBlock[]): string[] {
+  return blocks
+    .map((b) => `${b.blockType}:${b.range ?? b.offsetHex ?? "unknown"}`)
+    .sort();
+}
+
+function aceIceHandlerSignature(refs: AceIceHandlerReference[]): string[] {
+  return refs
+    .map((r) => `${r.commandTag ?? "unknown"}:${r.possibleHandlerFunction}`)
+    .sort();
+}
+
+function aceIceCapabilities(tags: string[]): string[] {
+  const set = new Set(tags);
+  const caps: string[] = [];
+  if (set.has("DFUm") || set.has("DFUd") || set.has("DFUf")) caps.push("DFU");
+  if (set.has("EUSB") || set.has("EURr") || set.has("UFPf")) caps.push("USB");
+  if (set.has("DPMc")) caps.push("PD");
+  if (set.has("VOUT")) caps.push("VOUT");
+  return caps;
+}
+
+function buildAceIceConclusion(params: {
+  commandTables: AceIceCommandTableBlock[];
+  firmwareMap: AceIceFirmwareMapBlock[];
+  handlerRefs: AceIceHandlerReference[];
+  thumbPatterns: ArmThumbCodePattern[];
+}): string | undefined {
+  const commandTable = params.commandTables.find((b) => b.blockType === "command_table_block");
+  if (!commandTable) return undefined;
+
+  const tags = aceIceTagSet(params.commandTables);
+  const caps = aceIceCapabilities(tags);
+  const stateTable = params.commandTables.find((b) => b.blockType === "state_string_table_block");
+  const hasDelimiter = tags.includes("!CMD");
+  const hasExecutableEvidence =
+    params.thumbPatterns.length > 0 ||
+    params.handlerRefs.length > 0 ||
+    params.firmwareMap.some((b) => b.blockType === "main_firmware_candidate" || b.blockType === "secondary_firmware_candidate");
+
+  const parts = [
+    `This dump contains an ACE/ICE command table with ${caps.length ? `${caps.join(", ")} related tags` : `${tags.length} known command/state tags`}.`,
+    `The command table appears near ${commandTable.startOffsetHex}${stateTable ? ` and a state table appears near ${stateTable.startOffsetHex}` : ""}.`,
+  ];
+
+  if (hasDelimiter) {
+    parts.push("It includes !CMD as a delimiter/prefix.");
+  }
+
+  if (hasExecutableEvidence) {
+    parts.push(
+      "This suggests the dump contains executable firmware logic and command/state metadata, not only static identity strings.",
+    );
+  } else {
+    parts.push(
+      "This suggests command/state metadata is present; executable-code evidence was not strong enough for a separate handler conclusion.",
+    );
+  }
+
+  return parts.join(" ");
 }
 
 export function compareFiles(
@@ -722,6 +1244,12 @@ export function compareFiles(
   bBlocks: AppleBlock[],
   bStats: { ffPercentage: number; zeroPercentage: number; entropy: number },
   bCd3217: Cd3217FirmwareBlock[],
+  aAceTables: AceIceCommandTableBlock[] = [],
+  bAceTables: AceIceCommandTableBlock[] = [],
+  aAceFirmwareMap: AceIceFirmwareMapBlock[] = [],
+  bAceFirmwareMap: AceIceFirmwareMapBlock[] = [],
+  aAceHandlers: AceIceHandlerReference[] = [],
+  bAceHandlers: AceIceHandlerReference[] = [],
 ): CompareResult {
   const sizeA = aBuf.length;
   const sizeB = bBuf.length;
@@ -760,6 +1288,28 @@ export function compareFiles(
   const modelB = mainModel(bBlocks);
   const cdA = aCd3217.map((b) => b.variant).find(Boolean);
   const cdB = bCd3217.map((b) => b.variant).find(Boolean);
+  const aceTagsA = aceIceTagSet(aAceTables);
+  const aceTagsB = aceIceTagSet(bAceTables);
+  const aceMissingFromA = arrayDiff(aceTagsB, aceTagsA);
+  const aceMissingFromB = arrayDiff(aceTagsA, aceTagsB);
+  const aceCapsA = aceIceCapabilities(aceTagsA);
+  const aceCapsB = aceIceCapabilities(aceTagsB);
+  const aceCapabilityDiffs = [
+    ...arrayDiff(aceCapsB, aceCapsA).map((c) => `${c} missing from A`),
+    ...arrayDiff(aceCapsA, aceCapsB).map((c) => `${c} missing from B`),
+  ];
+  const aceMapA = aceIceMapSignature(aAceFirmwareMap);
+  const aceMapB = aceIceMapSignature(bAceFirmwareMap);
+  const aceIceFirmwareMapDiffs = [
+    ...arrayDiff(aceMapB, aceMapA).map((x) => `A lacks ${x}`),
+    ...arrayDiff(aceMapA, aceMapB).map((x) => `B lacks ${x}`),
+  ];
+  const aceHandlersA = aceIceHandlerSignature(aAceHandlers);
+  const aceHandlersB = aceIceHandlerSignature(bAceHandlers);
+  const aceIceHandlerDiffs = [
+    ...arrayDiff(aceHandlersB, aceHandlersA).map((x) => `A lacks ${x}`),
+    ...arrayDiff(aceHandlersA, aceHandlersB).map((x) => `B lacks ${x}`),
+  ];
 
   const summaryParts: string[] = [];
   if (sizeA === sizeB) summaryParts.push("Both files have the same size");
@@ -789,6 +1339,19 @@ export function compareFiles(
     summaryParts.push(` CD3217 variant differs: A=${cdA}, B=${cdB}.`);
   }
 
+  if (aceTagsA.length || aceTagsB.length) {
+    if (!aceMissingFromA.length && !aceMissingFromB.length) {
+      summaryParts.push(` ACE/ICE command tags match (${aceTagsA.length} tag(s)).`);
+    } else {
+      summaryParts.push(
+        ` ACE/ICE command tags differ: missing from A [${aceMissingFromA.join(", ") || "none"}], missing from B [${aceMissingFromB.join(", ") || "none"}].`,
+      );
+    }
+    const tableA = firstAceIceOffset(aAceTables, "command_table_block");
+    const tableB = firstAceIceOffset(bAceTables, "command_table_block");
+    if (tableA || tableB) summaryParts.push(` Command table offsets: A=${tableA ?? "unknown"}, B=${tableB ?? "unknown"}.`);
+  }
+
   return {
     fileA: { fileName: aName, sizeBytes: sizeA, sha256: aSha, fileStats: aStats },
     fileB: { fileName: bName, sizeBytes: sizeB, sha256: bSha, fileStats: bStats },
@@ -801,6 +1364,17 @@ export function compareFiles(
     mainModelB: modelB,
     cd3217VariantA: cdA,
     cd3217VariantB: cdB,
+    aceIceTagsA: aceTagsA,
+    aceIceTagsB: aceTagsB,
+    aceIceMissingFromA: aceMissingFromA,
+    aceIceMissingFromB: aceMissingFromB,
+    aceIceCommandTableOffsetA: firstAceIceOffset(aAceTables, "command_table_block"),
+    aceIceCommandTableOffsetB: firstAceIceOffset(bAceTables, "command_table_block"),
+    aceIceStateTableOffsetA: firstAceIceOffset(aAceTables, "state_string_table_block"),
+    aceIceStateTableOffsetB: firstAceIceOffset(bAceTables, "state_string_table_block"),
+    aceIceFirmwareMapDiffs,
+    aceIceHandlerDiffs,
+    aceIceCapabilityDiffs: aceCapabilityDiffs,
   };
 }
 

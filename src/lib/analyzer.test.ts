@@ -3,6 +3,9 @@ import {
   calculateByteStats,
   calculateEntropy,
   compareFiles,
+  detectAceIceCommandTables,
+  detectAceIceFirmwareMap,
+  detectArmThumbCodePatterns,
   detectAppleBlocks,
   detectMetadataBlocks,
   detectCd3217FirmwareBlocks,
@@ -45,7 +48,7 @@ describe("detectAppleBlocks", () => {
     const main = blocks.find((b) => b.blockType === "main_device_block");
     expect(main?.deviceType?.value).toBe("iPhone");
     expect(main?.modelCode?.value).toBe("D37DEV");
-    expect(main?.confidence).toBeGreaterThanOrEqual(0.9); // Apple+type+model (0.4+0.3+0.2)
+    expect(main?.confidence).toBeCloseTo(0.9, 5); // Apple+type+model (0.4+0.3+0.2)
   });
 });
 
@@ -92,6 +95,42 @@ describe("detectThunderboltRetimerBlocks", () => {
     const blocks = detectThunderboltRetimerBlocks(buf);
     expect(blocks.length).toBeGreaterThan(0);
     expect(blocks.some((b) => b.blockType === "thunderbolt_drom_block")).toBe(true);
+  });
+});
+
+describe("ACE/ICE detection", () => {
+  it("detects grouped command and state tables", () => {
+    const buf = u8FromAscii(
+      "xxxxGSkX....DFUm....DFUd....DRST....EUSB....EURr....DPMc....VOUT....!CMD" +
+        "\0".repeat(300) +
+        "CFUp....APP....VOUT....UFPf....DFUf",
+    );
+    const tables = detectAceIceCommandTables(buf);
+    expect(tables.some((b) => b.blockType === "command_table_block")).toBe(true);
+    expect(tables.some((b) => b.blockType === "state_string_table_block")).toBe(true);
+    expect(tables.flatMap((b) => b.tags).some((t) => t.tag === "!CMD" && t.isCommandPrefixDelimiter)).toBe(true);
+  });
+
+  it("detects firmware map references near ACE/ICE structures", () => {
+    const buf = new Uint8Array(0x400);
+    buf.fill(0xff);
+    const tags = u8FromAscii("GSkX....DFUm....DFUd....DRST....EUSB....VOUT....!CMD");
+    buf.set(tags, 0x180);
+    buf.set(new Uint8Array([0x00, 0x04, 0x04, 0x20]), 0x220); // 0x20040400
+    buf.set(new Uint8Array([0x00, 0x04, 0x06, 0x40]), 0x224); // 0x40060400
+    const map = detectAceIceFirmwareMap(buf);
+    expect(map.some((b) => b.blockType === "config_block_candidate")).toBe(true);
+    expect(map.some((b) => b.blockType === "runtime_config_reference")).toBe(true);
+    expect(map.some((b) => b.blockType === "peripheral_register_reference")).toBe(true);
+  });
+
+  it("detects Thumb-like code patterns", () => {
+    const buf = new Uint8Array(0x120);
+    for (let i = 0; i < 0x100; i += 8) {
+      buf.set([0x00, 0xb5, 0x4d, 0x20, 0x00, 0xe0, 0x00, 0xbd], i);
+    }
+    const patterns = detectArmThumbCodePatterns(buf);
+    expect(patterns.some((p) => p.blockType === "handler_function_candidate")).toBe(true);
   });
 });
 
